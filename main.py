@@ -10,17 +10,21 @@ import rasterio
 from rasterio.merge import merge
 from rasterio.mask import mask
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from threading import Lock
 import time
 import json
 from log import logger
-
 
 TEMP_PATH = r"./Downloads/temp"
 DATA_PATH = r"./Downloads/MODIS"
 STATUS_PATH = r"./Downloads/status/"
 
-# 线程数量
-MAX_WORKERS = 8
+# 下载和镶嵌的线程数量
+MAX_WORKERS = 12
+MOSAIC_WORKERS = 2  # 镶嵌线程池最大任务数
+
+# 镶嵌线程池
+mosaic_executor = ThreadPoolExecutor(max_workers=MOSAIC_WORKERS)
 
 
 def initialize_gee(service_account, key_file, proxy_url):
@@ -42,15 +46,15 @@ def calculate_splits(bbox, split_length):
     return num_width, num_height
 
 
-def mask_cloud_and_water(image, selection):
+def mask_cloud_and_water(sentinel2, selection, num_bands=2, target_quality=15):
     """掩膜云和水体"""
-    QA = image.select(selection).toInt()
+    QA = sentinel2.select(selection).toInt()
     mask = ee.Image.constant(1)
-    for i in range(2):  # 遍历波段
+    for i in range(num_bands):  # 遍历波段
         startBit = 2 + i * 4
         bandQuality = QA.rightShift(startBit).bitwiseAnd(15)
-        mask = mask.min(bandQuality.neq(15))
-    return image.updateMask(mask)
+        mask = mask.min(bandQuality.neq(target_quality))
+    return sentinel2.updateMask(mask)
 
 
 def load_download_status(status_file):
@@ -100,9 +104,35 @@ def download_segment(w, h, data, prefix, split_length, bbox, scale, status, stat
         save_download_status(status_file, status)
 
 
+def mosaic_image(prefix):
+    """
+    镶嵌分块影像。
+    """
+    try:
+        logger.info(f"开始镶嵌影像: {prefix}")
+        search_criteria = os.path.join(TEMP_PATH, f"{prefix}_*.tif")
+        tiffs = glob.glob(search_criteria)
+        if tiffs:
+            src_files_to_mosaic = [rasterio.open(fp) for fp in tiffs]
+            mosaic, out_trans = merge(src_files_to_mosaic)
+            out_meta = src_files_to_mosaic[0].meta.copy()
+            out_meta.update(
+                {"driver": "GTiff", "height": mosaic.shape[1], "width": mosaic.shape[2], "transform": out_trans})
+            mosaic_name = os.path.join(DATA_PATH, f"{prefix}.tif")
+            with rasterio.open(mosaic_name, "w", **out_meta) as dest:
+                dest.write(mosaic)
+            logger.info(f"镶嵌完成: {mosaic_name}")
+        else:
+            logger.warning(f"未找到分块影像: {prefix}")
+    except Exception as e:
+        logger.error(f"镶嵌失败: {e}")
+
+
 def process_image(date_range, prefix, roi, scale, split_length, bbox, num_width, num_height,
                   max_workers, data_collection, data_band, data_mask):
-    """处理每个日期的影像下载和镶嵌"""
+    """
+    处理每个日期的影像下载和镶嵌任务（镶嵌在独立线程中进行）。
+    """
     status_file = f"{STATUS_PATH}{prefix}_status.json"
     logger.info(f"status_file={status_file}")
     mosaic_name = os.path.join(DATA_PATH, f"{prefix}.tif")
@@ -117,7 +147,8 @@ def process_image(date_range, prefix, roi, scale, split_length, bbox, num_width,
         .select(data_band) \
         .filterDate(start, end) \
         .filterBounds(roi).median().clip(roi)
-    data = mask_cloud_and_water(sentinel2, 'QC_500m').normalizedDifference(data_mask)
+    data = mask_cloud_and_water(sentinel2=sentinel2, selection="QC_500m", num_bands=len(data_mask),
+                                target_quality=15).normalizedDifference(data_mask)
 
     # 加载下载状态
     status = load_download_status(status_file)
@@ -129,25 +160,17 @@ def process_image(date_range, prefix, roi, scale, split_length, bbox, num_width,
             executor.submit(download_segment, w, h, data, prefix, split_length, bbox, scale, status, status_file)
             for w in range(num_width) for h in range(num_height)
         ]
+
+        # 等待所有分块下载完成
         for future in as_completed(futures):
             try:
                 future.result()
             except Exception as e:
                 logger.error(f"任务失败: {e}")
 
-    # 镶嵌影像
-    logger.info(f"开始镶嵌影像: {prefix}")
-    search_criteria = os.path.join(TEMP_PATH, f"{prefix}_*.tif")
-    tiffs = glob.glob(search_criteria)
-    if tiffs:
-        src_files_to_mosaic = [rasterio.open(fp) for fp in tiffs]
-        mosaic, out_trans = merge(src_files_to_mosaic)
-        out_meta = src_files_to_mosaic[0].meta.copy()
-        out_meta.update(
-            {"driver": "GTiff", "height": mosaic.shape[1], "width": mosaic.shape[2], "transform": out_trans})
-        with rasterio.open(mosaic_name, "w", **out_meta) as dest:
-            dest.write(mosaic)
-        logger.info(f"镶嵌完成: {mosaic_name}")
+    # 分块下载完成后，提交镶嵌任务到镶嵌线程池
+    logger.info(f"提交镶嵌任务到线程池: {prefix}")
+    mosaic_executor.submit(mosaic_image, prefix)
 
 
 def main():
