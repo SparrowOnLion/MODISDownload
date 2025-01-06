@@ -108,6 +108,21 @@ def mosaic_image(prefix):
     """
     镶嵌分块影像，并删除相关的临时文件。
     """
+    mosaic_status_file = os.path.join(STATUS_PATH, f"{prefix}_mosaic_status.json")
+
+    # 检查是否已经镶嵌完成
+    if os.path.exists(mosaic_status_file):
+        with open(mosaic_status_file, 'r') as f:
+            mosaic_status = json.load(f)
+        if mosaic_status.get('status') == 'completed':
+            logger.info(f"镶嵌任务已完成: {prefix}, 跳过")
+            return
+    else:
+        # 初始化镶嵌状态
+        mosaic_status = {"status": "incomplete"}
+        with open(mosaic_status_file, 'w') as f:
+            json.dump(mosaic_status, f)
+
     try:
         logger.info(f"开始镶嵌影像: {prefix}")
         search_criteria = os.path.join(TEMP_PATH, f"{prefix}_*.tif")
@@ -141,6 +156,12 @@ def mosaic_image(prefix):
                     logger.info(f"删除临时文件: {temp_file}")
                 except Exception as e:
                     logger.error(f"删除临时文件失败: {temp_file}, 错误: {e}")
+
+            # 更新镶嵌状态为完成
+            mosaic_status['status'] = 'completed'
+            with open(mosaic_status_file, 'w') as f:
+                json.dump(mosaic_status, f)
+
         else:
             logger.warning(f"未找到分块影像: {prefix}")
 
@@ -193,6 +214,18 @@ def process_image(date_range, prefix, roi, scale, split_length, bbox, num_width,
     mosaic_executor.submit(mosaic_image, prefix)
 
 
+def resume_incomplete_tasks():
+    """检查并恢复未完成的镶嵌任务"""
+    logger.info("检查未完成的镶嵌任务...")
+    for status_file in glob.glob(os.path.join(STATUS_PATH, "*_mosaic_status.json")):
+        with open(status_file, 'r') as f:
+            mosaic_status = json.load(f)
+        if mosaic_status.get('status') == 'incomplete':
+            prefix = os.path.basename(status_file).replace("_mosaic_status.json", "")
+            logger.info(f"恢复未完成的镶嵌任务: {prefix}")
+            mosaic_executor.submit(mosaic_image, prefix)
+
+
 def main():
     """主程序入口"""
     for dir_path in [STATUS_PATH, DATA_PATH, TEMP_PATH]:
@@ -205,6 +238,9 @@ def main():
         key_file=r"D:\YJ_data_download\GEE\data\key\ancient-jigsaw-442804-q8-85d6ae8e78eb.json",
         proxy_url="127.0.0.1:7890"
     )
+
+    # 恢复未完成的任务
+    resume_incomplete_tasks()
 
     # 定义区域和分块
     roi = ee.Geometry.Polygon(
