@@ -106,24 +106,44 @@ def download_segment(w, h, data, prefix, split_length, bbox, scale, status, stat
 
 def mosaic_image(prefix):
     """
-    镶嵌分块影像。
+    镶嵌分块影像，并删除相关的临时文件。
     """
     try:
         logger.info(f"开始镶嵌影像: {prefix}")
         search_criteria = os.path.join(TEMP_PATH, f"{prefix}_*.tif")
         tiffs = glob.glob(search_criteria)
+
         if tiffs:
+            # 打开所有分块影像文件
             src_files_to_mosaic = [rasterio.open(fp) for fp in tiffs]
+
+            # 执行镶嵌
             mosaic, out_trans = merge(src_files_to_mosaic)
             out_meta = src_files_to_mosaic[0].meta.copy()
             out_meta.update(
-                {"driver": "GTiff", "height": mosaic.shape[1], "width": mosaic.shape[2], "transform": out_trans})
+                {"driver": "GTiff", "height": mosaic.shape[1], "width": mosaic.shape[2], "transform": out_trans}
+            )
+
+            # 保存镶嵌后的影像
             mosaic_name = os.path.join(DATA_PATH, f"{prefix}.tif")
             with rasterio.open(mosaic_name, "w", **out_meta) as dest:
                 dest.write(mosaic)
             logger.info(f"镶嵌完成: {mosaic_name}")
+
+            # 关闭影像文件句柄
+            for src in src_files_to_mosaic:
+                src.close()
+
+            # 删除临时文件
+            for temp_file in tiffs:
+                try:
+                    os.remove(temp_file)
+                    logger.info(f"删除临时文件: {temp_file}")
+                except Exception as e:
+                    logger.error(f"删除临时文件失败: {temp_file}, 错误: {e}")
         else:
             logger.warning(f"未找到分块影像: {prefix}")
+
     except Exception as e:
         logger.error(f"镶嵌失败: {e}")
 
