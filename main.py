@@ -42,9 +42,9 @@ def calculate_splits(bbox, split_length):
     return num_width, num_height
 
 
-def mask_cloud_and_water(image):
+def mask_cloud_and_water(image, selection):
     """掩膜云和水体"""
-    QA = image.select('QC_500m').toInt()
+    QA = image.select(selection).toInt()
     mask = ee.Image.constant(1)
     for i in range(2):  # 遍历波段
         startBit = 2 + i * 4
@@ -117,7 +117,7 @@ def process_image(date_range, prefix, roi, scale, split_length, bbox, num_width,
         .select(data_band) \
         .filterDate(start, end) \
         .filterBounds(roi).median().clip(roi)
-    data = mask_cloud_and_water(sentinel2).normalizedDifference(data_mask)
+    data = mask_cloud_and_water(sentinel2, 'QC_500m').normalizedDifference(data_mask)
 
     # 加载下载状态
     status = load_download_status(status_file)
