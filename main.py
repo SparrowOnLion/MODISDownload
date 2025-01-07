@@ -13,23 +13,26 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from threading import Lock
 import time
 import json
+
 from log import logger
+import config
 
-TEMP_PATH = r"./Downloads/temp"
-DATA_PATH = r"./Downloads/MODIS"
-STATUS_PATH = r"./Downloads/status/"
-KEY_PATH = r"./key/ancient-jigsaw-442804-q8-85d6ae8e78eb.json"
-SHAPEDATA_PATH = r"./shapedata/china_bound.geojson"
-
-# 下载和镶嵌的线程数量
-MAX_WORKERS = 10  # earthengine.googleapis.com. Connection pool size: 10
-MOSAIC_WORKERS = 2  # 镶嵌线程池最大任务数
 
 # 镶嵌线程池
-mosaic_executor = ThreadPoolExecutor(max_workers=MOSAIC_WORKERS)
+mosaic_executor = ThreadPoolExecutor(max_workers=config.MOSAIC_WORKERS)
 
-with fiona.open(SHAPEDATA_PATH, 'r') as file:
-    shapes_set = [feature['geometry'] for feature in file]
+# 裁剪数据
+try:
+    with fiona.open(config.SHAPEDATA_PATH, 'r') as file:
+        global_shapes_set = [feature['geometry'] for feature in file]
+        if not global_shapes_set:
+            logger.error(f"GeoJSON 文件中未找到任何几何数据;global_shapes_set={global_shapes_set}")
+        else:
+            logger.info(f"成功加载 {len(global_shapes_set)} 个几何对象;global_shapes_set={global_shapes_set}")
+except FileNotFoundError:
+    logger.error(f"文件未找到：{config.SHAPEDATA_PATH};global_shapes_set={global_shapes_set}")
+except fiona.errors.DriverError as e:
+    logger.error(f"文件格式错误或无法打开：{e};global_shapes_set={global_shapes_set}")
 
 
 def initialize_gee(service_account, key_file, proxy_url):
@@ -89,7 +92,7 @@ def download_segment(w, h, data, prefix, split_length, bbox, scale, status, stat
         logger.info(f"{pre_fn} 已完成，跳过")
         return
 
-    temp_fn = os.path.join(TEMP_PATH, pre_fn)
+    temp_fn = os.path.join(config.TEMP_PATH, pre_fn)
     success = False
     for attempt in range(retries):
         try:
@@ -117,7 +120,7 @@ def mosaic_image(prefix, shapes=None):
         prefix: 文件前缀
         shapes: 用于裁剪的地理边界形状
     """
-    mosaic_status_file = os.path.join(STATUS_PATH, f"{prefix}_mosaic_status.json")
+    mosaic_status_file = os.path.join(config.STATUS_PATH, f"{prefix}_mosaic_status.json")
     # 检查是否已经镶嵌完成
     if os.path.exists(mosaic_status_file):
         with open(mosaic_status_file, 'r') as f:
@@ -133,13 +136,13 @@ def mosaic_image(prefix, shapes=None):
 
     try:
         logger.info(f"开始镶嵌影像: {prefix}")
-        search_criteria = os.path.join(TEMP_PATH, f"{prefix}_*.tif")
+        search_criteria = os.path.join(config.TEMP_PATH, f"{prefix}_*.tif")
         tiffs = glob.glob(search_criteria)
 
         if tiffs:
             # 创建临时镶嵌文件名
-            temp_mosaic_name = os.path.join(TEMP_PATH, f"{prefix}_temp_mosaic.tif")
-            final_mosaic_name = os.path.join(DATA_PATH, f"{prefix}.tif")
+            temp_mosaic_name = os.path.join(config.TEMP_PATH, f"{prefix}_temp_mosaic.tif")
+            final_mosaic_name = os.path.join(config.DATA_PATH, f"{prefix}.tif")
 
             # 打开所有分块影像文件
             src_files_to_mosaic = [rasterio.open(fp) for fp in tiffs]
@@ -216,9 +219,9 @@ def process_image(date_range, prefix, roi, scale, split_length, bbox, num_width,
     """
     处理每个日期的影像下载和镶嵌任务（镶嵌在独立线程中进行）。
     """
-    status_file = f"{STATUS_PATH}{prefix}_status.json"
+    status_file = f"{config.STATUS_PATH}{prefix}_status.json"
     logger.info(f"status_file={status_file}")
-    mosaic_name = os.path.join(DATA_PATH, f"{prefix}.tif")
+    mosaic_name = os.path.join(config.DATA_PATH, f"{prefix}.tif")
 
     if os.path.exists(mosaic_name):
         logger.info(f"{mosaic_name} 已存在，跳过")
@@ -230,8 +233,8 @@ def process_image(date_range, prefix, roi, scale, split_length, bbox, num_width,
         .select(data_band) \
         .filterDate(start, end) \
         .filterBounds(roi).median().clip(roi)
-    data = mask_cloud_and_water(sentinel2=sentinel2, selection="QC_500m", num_bands=len(data_mask),
-                                target_quality=15).normalizedDifference(data_mask)
+    data = mask_cloud_and_water(sentinel2=sentinel2, selection=config.QUALITY_BAND, num_bands=config.NUM_BANDS,
+                                target_quality=config.TARGET_QUALITY).normalizedDifference(data_mask)
 
     # 加载下载状态
     status = load_download_status(status_file)
@@ -253,68 +256,55 @@ def process_image(date_range, prefix, roi, scale, split_length, bbox, num_width,
 
     # 分块下载完成后，提交镶嵌任务到镶嵌线程池
     logger.info(f"提交镶嵌任务到线程池: {prefix}")
-    mosaic_executor.submit(mosaic_image, prefix, shapes=shapes_set)
+    mosaic_executor.submit(mosaic_image, prefix, global_shapes_set)
 
 
 def resume_incomplete_tasks():
     """检查并恢复未完成的镶嵌任务"""
     logger.info("检查未完成的镶嵌任务...")
-    for status_file in glob.glob(os.path.join(STATUS_PATH, "*_mosaic_status.json")):
+    for status_file in glob.glob(os.path.join(config.STATUS_PATH, "*_mosaic_status.json")):
         with open(status_file, 'r') as f:
             mosaic_status = json.load(f)
         if mosaic_status.get('status') == 'incomplete':
             prefix = os.path.basename(status_file).replace("_mosaic_status.json", "")
             logger.info(f"恢复未完成的镶嵌任务: {prefix}")
-            mosaic_executor.submit(mosaic_image, prefix)
+            mosaic_executor.submit(mosaic_image, prefix, global_shapes_set)
 
 
 def main():
     """主程序入口"""
-    for dir_path in [STATUS_PATH, DATA_PATH, TEMP_PATH]:
+    for dir_path in [config.STATUS_PATH, config.DATA_PATH, config.TEMP_PATH]:
         if not os.path.exists(dir_path):
             os.makedirs(dir_path)
             logger.info(f"创建目录: {dir_path}")
     # 初始化
     initialize_gee(
-        service_account="gee-555@ancient-jigsaw-442804-q8.iam.gserviceaccount.com",
-        key_file=KEY_PATH,
-        proxy_url="127.0.0.1:7890"
+        service_account=config.SERVICE_ACCOUNT,
+        key_file=config.KEY_PATH,
+        proxy_url=config.PROXY_URL
     )
 
     # 恢复未完成的任务
     resume_incomplete_tasks()
 
     # 定义区域和分块
-    roi = ee.Geometry.Polygon(
-        [[[73.5, 18],
-          [135.5, 18],
-          [135.5, 54],
-          [73.5, 54],
-          [73.5, 18]]]
-    )
+    roi = ee.Geometry.Polygon(config.ROI)
     bbox = roi.bounds().getInfo()['coordinates'][0]
-    num_width, num_height = calculate_splits(bbox, split_length=5)
+    num_width, num_height = calculate_splits(bbox, split_length=config.SPLIT_LENGTH)
 
     # 时间范围
-    start_date = "2023-07-01"
-    end_date = "2023-12-31"
-    mdate = pd.date_range(start=start_date, end=end_date, freq="1D").strftime("%Y-%m-%d")
+    start_date = config.START_DATA
+    end_date = config.END_DATA
+    mdate = pd.date_range(start=start_date, end=end_date, freq=config.FREQ).strftime("%Y-%m-%d")
     edate = mdate[1:]
     sdate = mdate[:-1]
-
-    # 数据要求
-    data_collection = 'MODIS/061/MYD09GA'
-    data_band = ['sur_refl_b02', 'sur_refl_b01', 'QC_500m']
-    data_mask = ['sur_refl_b02', 'sur_refl_b01']
 
     # 下载和处理
     for i, (start, end) in enumerate(zip(sdate, edate)):
         prefix = f"NDVI_{start}_{datetime.datetime.strptime(start, '%Y-%m-%d').strftime('%j')}"
-        process_image((start, end), prefix, roi=roi, scale=500, split_length=5, bbox=bbox, num_width=num_width,
-                      num_height=num_height, max_workers=MAX_WORKERS, data_collection=data_collection,
-                      data_band=data_band,
-                      data_mask=data_mask
-                      )
+        process_image((start, end), prefix, roi=roi, scale=config.SCALE, split_length=config.SPLIT_LENGTH, bbox=bbox, num_width=num_width,
+                      num_height=num_height, max_workers=config.MAX_WORKERS, data_collection=config.DATA_COLLECTION,
+                      data_band=config.DATA_BAND,data_mask=config.DATA_MASK)
 
 
 if __name__ == "__main__":
