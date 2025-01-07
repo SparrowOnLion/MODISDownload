@@ -18,13 +18,18 @@ from log import logger
 TEMP_PATH = r"./Downloads/temp"
 DATA_PATH = r"./Downloads/MODIS"
 STATUS_PATH = r"./Downloads/status/"
+KEY_PATH = r"./key/ancient-jigsaw-442804-q8-85d6ae8e78eb.json"
+SHAPEDATA_PATH = r"./shapedata/china_bound.geojson"
 
 # 下载和镶嵌的线程数量
-MAX_WORKERS = 12
+MAX_WORKERS = 10  # earthengine.googleapis.com. Connection pool size: 10
 MOSAIC_WORKERS = 2  # 镶嵌线程池最大任务数
 
 # 镶嵌线程池
 mosaic_executor = ThreadPoolExecutor(max_workers=MOSAIC_WORKERS)
+
+with fiona.open(SHAPEDATA_PATH, 'r') as file:
+    shapes_set = [feature['geometry'] for feature in file]
 
 
 def initialize_gee(service_account, key_file, proxy_url):
@@ -104,12 +109,15 @@ def download_segment(w, h, data, prefix, split_length, bbox, scale, status, stat
         save_download_status(status_file, status)
 
 
-def mosaic_image(prefix):
+def mosaic_image(prefix, shapes=None):
     """
-    镶嵌分块影像，并删除相关的临时文件。
+    镶嵌分块影像，并用中国边界裁剪结果，最后删除相关的临时文件。
+
+    Args:
+        prefix: 文件前缀
+        shapes: 用于裁剪的地理边界形状
     """
     mosaic_status_file = os.path.join(STATUS_PATH, f"{prefix}_mosaic_status.json")
-
     # 检查是否已经镶嵌完成
     if os.path.exists(mosaic_status_file):
         with open(mosaic_status_file, 'r') as f:
@@ -129,33 +137,66 @@ def mosaic_image(prefix):
         tiffs = glob.glob(search_criteria)
 
         if tiffs:
+            # 创建临时镶嵌文件名
+            temp_mosaic_name = os.path.join(TEMP_PATH, f"{prefix}_temp_mosaic.tif")
+            final_mosaic_name = os.path.join(DATA_PATH, f"{prefix}.tif")
+
             # 打开所有分块影像文件
             src_files_to_mosaic = [rasterio.open(fp) for fp in tiffs]
 
             # 执行镶嵌
             mosaic, out_trans = merge(src_files_to_mosaic)
             out_meta = src_files_to_mosaic[0].meta.copy()
+            crs = src_files_to_mosaic[0].crs  # 保存坐标系统信息
+
             out_meta.update(
-                {"driver": "GTiff", "height": mosaic.shape[1], "width": mosaic.shape[2], "transform": out_trans}
+                {"driver": "GTiff",
+                 "height": mosaic.shape[1],
+                 "width": mosaic.shape[2],
+                 "transform": out_trans,
+                 "crs": crs}  # 添加坐标系统信息
             )
 
-            # 保存镶嵌后的影像
-            mosaic_name = os.path.join(DATA_PATH, f"{prefix}.tif")
-            with rasterio.open(mosaic_name, "w", **out_meta) as dest:
+            # 保存临时镶嵌文件
+            with rasterio.open(temp_mosaic_name, "w", **out_meta) as dest:
                 dest.write(mosaic)
-            logger.info(f"镶嵌完成: {mosaic_name}")
 
             # 关闭影像文件句柄
             for src in src_files_to_mosaic:
                 src.close()
 
+            # 使用中国边界进行裁剪
+            if shapes is not None:
+                logger.info(f"使用地理边界裁剪影像: {temp_mosaic_name}")
+                with rasterio.open(temp_mosaic_name) as src:
+                    out_image, out_transform = rasterio.mask.mask(src, shapes, crop=True)
+                    clip_meta = src.meta.copy()
+
+                clip_meta.update({"driver": "GTiff",
+                                  "height": out_image.shape[1],
+                                  "width": out_image.shape[2],
+                                  "transform": out_transform,
+                                  # "crs": crs
+                                  })
+
+                # 保存最终裁剪后的文件
+                with rasterio.open(final_mosaic_name, "w", **clip_meta) as dest:
+                    dest.write(out_image)
+            else:
+                # 如果没有提供shapes，直接使用镶嵌结果
+                os.rename(temp_mosaic_name, final_mosaic_name)
+
+            logger.info(f"镶嵌和裁剪完成: {final_mosaic_name}")
+
             # 删除临时文件
-            for temp_file in tiffs:
-                try:
+            try:
+                if os.path.exists(temp_mosaic_name):
+                    os.remove(temp_mosaic_name)
+                for temp_file in tiffs:
                     os.remove(temp_file)
-                    logger.info(f"删除临时文件: {temp_file}")
-                except Exception as e:
-                    logger.error(f"删除临时文件失败: {temp_file}, 错误: {e}")
+                logger.info("临时文件清理完成")
+            except Exception as e:
+                logger.error(f"删除临时文件失败: {e}")
 
             # 更新镶嵌状态为完成
             mosaic_status['status'] = 'completed'
@@ -167,6 +208,7 @@ def mosaic_image(prefix):
 
     except Exception as e:
         logger.error(f"镶嵌失败: {e}")
+        raise
 
 
 def process_image(date_range, prefix, roi, scale, split_length, bbox, num_width, num_height,
@@ -211,7 +253,7 @@ def process_image(date_range, prefix, roi, scale, split_length, bbox, num_width,
 
     # 分块下载完成后，提交镶嵌任务到镶嵌线程池
     logger.info(f"提交镶嵌任务到线程池: {prefix}")
-    mosaic_executor.submit(mosaic_image, prefix)
+    mosaic_executor.submit(mosaic_image, prefix, shapes=shapes_set)
 
 
 def resume_incomplete_tasks():
@@ -235,7 +277,7 @@ def main():
     # 初始化
     initialize_gee(
         service_account="gee-555@ancient-jigsaw-442804-q8.iam.gserviceaccount.com",
-        key_file=r"D:\YJ_data_download\GEE\data\key\ancient-jigsaw-442804-q8-85d6ae8e78eb.json",
+        key_file=KEY_PATH,
         proxy_url="127.0.0.1:7890"
     )
 
