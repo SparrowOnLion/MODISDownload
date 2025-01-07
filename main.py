@@ -21,7 +21,7 @@ import config
 # 镶嵌线程池
 mosaic_executor = ThreadPoolExecutor(max_workers=config.MOSAIC_WORKERS)
 
-# 裁剪数据
+# 裁剪数据，找不到文件则直接判空
 try:
     with fiona.open(config.SHAPEDATA_PATH, 'r') as file:
         global_shapes_set = [feature['geometry'] for feature in file]
@@ -113,13 +113,7 @@ def download_segment(w, h, data, prefix, split_length, bbox, scale, status, stat
 
 
 def mosaic_image(prefix, shapes=None):
-    """
-    镶嵌分块影像，并用中国边界裁剪结果，最后删除相关的临时文件。
-
-    Args:
-        prefix: 文件前缀
-        shapes: 用于裁剪的地理边界形状
-    """
+    """镶嵌分块影像，并用中国边界裁剪结果，最后删除相关的临时文件。"""
     mosaic_status_file = os.path.join(config.STATUS_PATH, f"{prefix}_mosaic_status.json")
     # 检查是否已经镶嵌完成
     if os.path.exists(mosaic_status_file):
@@ -254,9 +248,9 @@ def process_image(date_range, prefix, roi, scale, split_length, bbox, num_width,
             except Exception as e:
                 logger.error(f"任务失败: {e}")
 
-    # 分块下载完成后，提交镶嵌任务到镶嵌线程池
-    logger.info(f"提交镶嵌任务到线程池: {prefix}")
-    mosaic_executor.submit(mosaic_image, prefix, global_shapes_set)
+        # 分块下载完成后，提交镶嵌任务到镶嵌线程池
+        logger.info(f"提交镶嵌任务到线程池: {prefix}")
+        mosaic_executor.submit(mosaic_image, prefix, global_shapes_set)
 
 
 def resume_incomplete_tasks():
@@ -267,7 +261,7 @@ def resume_incomplete_tasks():
             mosaic_status = json.load(f)
         if mosaic_status.get('status') == 'incomplete':
             prefix = os.path.basename(status_file).replace("_mosaic_status.json", "")
-            logger.info(f"恢复未完成的镶嵌任务: {prefix}")
+            logger.info(f"恢复未完成的镶嵌任务,提交到线程池: {prefix}")
             mosaic_executor.submit(mosaic_image, prefix, global_shapes_set)
 
 
@@ -277,7 +271,7 @@ def main():
         if not os.path.exists(dir_path):
             os.makedirs(dir_path)
             logger.info(f"创建目录: {dir_path}")
-    # 初始化
+    # 初始化GEE
     initialize_gee(
         service_account=config.SERVICE_ACCOUNT,
         key_file=config.KEY_PATH,

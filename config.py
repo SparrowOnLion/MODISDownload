@@ -11,8 +11,8 @@ DATA_PATH = r"./Downloads/MODIS"
 STATUS_PATH = r"./Downloads/status/"
 
 # 下载和镶嵌的线程数量
-MAX_WORKERS = 10  # earthengine.googleapis.com. Connection pool size: 10
-MOSAIC_WORKERS = 2
+MAX_WORKERS = 10  # 并行下载数量 earthengine.googleapis.com. Connection pool size: 10
+MOSAIC_WORKERS = 2  # 镶嵌线程池大小
 
 # 下载参数
 # 定义区域和分块
